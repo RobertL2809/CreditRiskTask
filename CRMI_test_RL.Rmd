@@ -1,0 +1,149 @@
+---
+title: "CRMI Task 1"
+author: "Robert Lee"
+date: "2026-03-23"
+output:
+  pdf_document: default
+  html_document:
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# install.packages(c("dplyr", "readxl", "tidyr", "broom", "knitr")) #run if needed
+library(dplyr)
+library(readxl)
+library(tidyr)
+library(broom) #for tidying model outputs
+library(knitr) #for better tables
+
+```
+
+# Introduction
+
+This document shows my approach to building a basic Probability of Default (PD) model using the provided customer data. I will walk through how I cleaned the dataset, decided to create a few helpful new variables, trained a logistic regression model, and evaluated the results.
+
+# Data Description & Variables
+
+### A Quick Look at the Data
+The dataset gives a very clear picture of how these customers have handled their loans. While the technical definitions are provided in the "2. Description" sheet, the data basically shows three main areas: who the customer is, what their current situation looks like, and what their past payment habits have been. 
+
+Here is exactly what the dataset tracks for each customer:
+
+* Basic Demographics:
+  * CUSTOMER_AGE: How old the customer is.
+
+* Their Current Situation (Right Now):
+  * CUSTOMER_ACTIVE_CONTRACTS: How many open, ongoing loans they currently have.
+  * CUSTOMER_ACTIVE_EXPOSURE: The total amount of money they currently owe on those open loans.
+  * CUSTOMER_CURRENT_DPD (Days Past Due): Exactly how many days late they are on a payment right at this moment.
+
+* Their Past Payment Habits (History):
+  * CUSTOMER_CONCLUDED_CONTRACTS: How many loans they have successfully paid off and closed in the past.
+  * CUSTOMER_PAYMENTS_LAST_36M: The total number of individual payments they've made over the last 3 years (shows how consistently they pay).
+  * CUSTOMER_PAID_AMOUNT_LAST_36M: The total money they've paid back over that same 3-year period.
+  * CUSTOMER_LONGEST_PAST_DPD_LENGTH: The absolute longest streak of days they have ever been late on a payment in the past.
+  * CUSTOMER_LONGEST_PAST_DPD_END_DATE: The exact date when they finally caught up and paid off that worst late streak (shows us how recently they struggled). 
+
+* Target of the dataset
+  * DEFAULTED: A simple 1 or 0 flag telling us if the customer ultimately defaulted (failed to pay) or not. This is what i need to train the model to predict.
+
+### Handling Missing Data
+While exploring the data, I noticed some blank cells (`NA`). For columns tracking late payments (like `CUSTOMER_LONGEST_PAST_DPD_LENGTH`), I am pretty sure that a blank cell simply means the customer has never been late. I filled these blanks with `0` so the model could use that information without deleting the whole row. 
+
+Also, for safety I added a filter to drop any rows where the final `DEFAULTED` answer might be missing. Even though this current dataset didn't have any missing answers here, this is a good safety net to ensure the model never tries to learn from an empty answer key if we feed it new data later.
+
+### Creating New Variables
+Instead of just feeding the raw data into the model, I created a few new columns that could help the algorithm catch underlying customer behaviors. It was also asked if there were any new variables I could construct, that could be helpful for the model.
+
+* AVG_PAYMENT_SIZE (Total Paid Amount / Total Payments):
+    * *Why I made it:* Someone making a few huge payments might have a different risk profile than someone making lots of tiny, frequent payments. This variable helps the model see their typical payment habit.
+* TOTAL_CONTRACTS (Active Contracts + Concluded Contracts):
+    * *Why I made it:* This shows the overall depth of the customer's relationship with the lender. A customer who has successfully finished multiple contracts in the past is usually much less risky than a brand-new customer with only one active loan and 0 finsihed loans. (In the end it turned out to be multicollinearity, so this variable is a little bit useless for the model, but my first instinct was to make it so i left it in this report)
+* HAS_BEEN_LATE (1 if they were ever late, 0 if they were never late):
+    * *Why I made it:* Sometimes, just having a history of missing a payment is a big red flag, regardless of exactly how many days late it was. This gives the model a very clear, simple signal to look at.
+    
+### Fixing Excel Dates & making a time variable
+One interesting quirk in the data was the `CUSTOMER_LONGEST_PAST_DPD_END_DATE` column. Instead of readable dates, Excel exported them as raw 5-digit serial numbers. If I fed that directly into the logistic regression, the model would get confused 
+
+To fix this and make the data useful, I translated those numbers back into real dates in R. However, models are not good with calendar dates; they work better with time elapsed. So, I found the most recent date in the entire dataset (I called it "snapshot date") and calculated exactly how many days had passed since the customer's worst late payment. 
+
+Finally, for the customers who had never been late (the `NA` values), I didn't want to put a `0` because the model would think they were late zero days ago (meaning today!). Instead, I filled those blanks with a massive number (`10000`). This acts as a clear signal to the model that the person is safe.
+
+```{r}
+#loading the data 
+df <- read_excel("Data_CRMI_Test_task.xlsx", sheet = "1. Data")
+
+#Cleaning and new variables
+#Filled missing values with 0 for the columns with NA before creating new variables
+df_clean <- df %>%
+  replace_na(list(CUSTOMER_LONGEST_PAST_DPD_LENGTH = 0,
+                  CUSTOMER_CONCLUDED_CONTRACTS = 0,
+                  CUSTOMER_PAYMENTS_LAST_36M = 0,
+                  CUSTOMER_PAID_AMOUNT_LAST_36M = 0)) %>% #making the new variables for the model with mutate 
+  mutate(AVG_PAYMENT_SIZE = ifelse(CUSTOMER_PAYMENTS_LAST_36M == 0, 0, #dividing by 0 is a problem, so went around it
+                                   CUSTOMER_PAID_AMOUNT_LAST_36M / CUSTOMER_PAYMENTS_LAST_36M),
+         TOTAL_CONTRACTS = CUSTOMER_ACTIVE_CONTRACTS + CUSTOMER_CONCLUDED_CONTRACTS,
+         HAS_BEEN_LATE = ifelse(CUSTOMER_LONGEST_PAST_DPD_LENGTH > 0, 1, 0),
+         DEFAULTED = as.factor(DEFAULTED), #deafulted needs to be a factor for logistic regression
+         FIXED_END_DATE = as.Date(CUSTOMER_LONGEST_PAST_DPD_END_DATE, origin = "1899-12-30"), #Fixing the weird Excel serial number
+         DAYS_SINCE_WORST_LATE = as.numeric(max(FIXED_END_DATE, na.rm = TRUE) - FIXED_END_DATE), #Finding the "Snapshot Date" (the newest date in the whole column) and calculate how many days passed between then and the customer's worst late payment
+         DAYS_SINCE_WORST_LATE = replace_na(DAYS_SINCE_WORST_LATE, 10000)) %>%  #If they were never late (NA), i decided to put a very high number like 10000 beacuse if the number is 0, it means the were late today and thats not good i think
+  select(-CUSTOMER_LONGEST_PAST_DPD_END_DATE, -FIXED_END_DATE) #dropping raw date columns
+
+#training data, just removed the NA-s if there were any. Seemed like there were not but just to be sure
+train_data <- df_clean %>%
+  filter(!is.na(DEFAULTED))
+```
+
+# Simplified Probability of Default Model
+
+We will utilize a Logistic Regression model, which is the industry standard for simplified credit risk scoring due to its interpretability and direct probability outputs.
+```{r}
+#training the logistic regression model
+pd_model <- glm(DEFAULTED ~ . - CONTRACT_ID, data = train_data, family = "binomial")
+summary(pd_model)
+#displaying the summary in a more beautiful table
+tidy_model <- tidy(pd_model)
+kable(tidy_model, digits = 4, caption = "Logistic Regression Model Summary")
+```
+
+Cause a few of the variables are not statistically important for the model (p-value more than 0.05) to predict a customer of defaulting and TOTAL_CONTRACTS was not maybe the best variable to make for the model beacuse of multicollinearity, I decided to remove these variables from the model (Taking AVG_PAYMENT_SIZE out aswell, because if i remove not statistically important variables AVG_PAYMENT_SIZE turns into a not statistically important variable).
+
+```{r}
+#training the refined logistic regression model
+pd_model <- glm(DEFAULTED ~ . - CONTRACT_ID - TOTAL_CONTRACTS - CUSTOMER_PAID_AMOUNT_LAST_36M - CUSTOMER_ACTIVE_EXPOSURE - AVG_PAYMENT_SIZE, data = train_data, family = "binomial")
+
+#table
+tidy_model <- tidy(pd_model)
+kable(tidy_model, digits = 4, caption = "Refined Logistic Regression Model Summary")
+```
+
+
+# Model Evaluation & Predictions
+
+Based on the logistic regression summary, CUSTOMER_CURRENT_DPD has the strongest impact in predicting the probability of default. It has the highest absolute z-statistic and is highly statistically significant, indicating it is the primary driver of risk in this dataset. Next two were variables I made: DAYS_SINCE_WORST_LATE and HAS_BEEN_LATE were also with strong impact and high z-score and also statistically significant.
+
+Now to Predicting the chance fo defaulting for Customer ID = 1015892
+
+```{r}
+#filter for the specific customer
+target_customer <- df_clean %>%
+  filter(CONTRACT_ID == 1015892)
+
+#to predict probability (type = "response" gives probabilities instead of log-odds)
+prob <- predict(pd_model, newdata = target_customer, type = "response")
+
+cat("The predicted Probability of Default for Customer 1015892 is:", round(prob * 100, 2), "%\n")
+```
+
+# Beyond Available Data
+
+If we were building this model for real-world use at a bank, I would want some extra information that isn't included in this dataset. Here are a few key things that would make our predictions much stronger:
+
+* Income & Debt-to-Income (DTI) Ratio: Right now, I only see how much the customer owes, but I don't know how much they make. Knowing their salary is important for figuring out if they can actually afford their monthly payments.
+* Employment Status: Knowing if someone has a steady job—and how long they've been working there is pretty important. Stable employment usually means steady payments, while a recent job loss is a major warning sign that they might default soon.
+* External Credit Scores: This dataset only shows how the customer behaves with this bank. If possible, an outside credit score would tell us the full story, letting us know if they are maxing out credit cards or missing car payments or something like that at other banks.
+* What the Loan is For (Loan Purpose): The reason for the loan matters a lot. For example, a mortgage (which is backed by an actual house) carries a very different risk than someone taking out a personal loan to go on a vacation or buy a new watch.
