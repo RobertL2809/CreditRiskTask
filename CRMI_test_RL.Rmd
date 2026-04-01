@@ -147,3 +147,105 @@ If we were building this model for real-world use at a bank, I would want some e
 * Employment Status: Knowing if someone has a steady job—and how long they've been working there is pretty important. Stable employment usually means steady payments, while a recent job loss is a major warning sign that they might default soon.
 * External Credit Scores: This dataset only shows how the customer behaves with this bank. If possible, an outside credit score would tell us the full story, letting us know if they are maxing out credit cards or missing car payments or something like that at other banks.
 * What the Loan is For (Loan Purpose): The reason for the loan matters a lot. For example, a mortgage (which is backed by an actual house) carries a very different risk than someone taking out a personal loan to go on a vacation or buy a new watch.
+
+
+# Model Evaluation
+
+To properly evaluate our model, we first need to split the data into a training set
+and a test set. This way, we check performance on data the model has never seen before.
+
+```{r}
+#install.packages("pROC") # run if needed
+library(pROC)
+
+# Setting a seed so results are reproducible
+set.seed(42)
+
+# 80% train, 20% test split
+train_index <- sample(seq_len(nrow(train_data)), size = 0.8 * nrow(train_data))
+train_split  <- train_data[train_index, ]
+test_split   <- train_data[-train_index, ]
+
+# Retrain the same final model on train split only
+pd_model_eval <- glm(DEFAULTED ~ . - CONTRACT_ID - TOTAL_CONTRACTS
+                       - CUSTOMER_PAID_AMOUNT_LAST_36M
+                       - CUSTOMER_ACTIVE_EXPOSURE
+                       - AVG_PAYMENT_SIZE,
+                     data   = train_split,
+                     family = "binomial")
+
+# Predict probabilities on the held-out test set
+test_probs <- predict(pd_model_eval, newdata = test_split, type = "response")
+
+# Convert to binary predictions using 0.5 threshold
+test_preds <- ifelse(test_probs > 0.5, 1, 0)
+actual     <- as.numeric(as.character(test_split$DEFAULTED))
+```
+
+### Confusion Matrix
+
+```{r}
+conf_matrix <- table(Predicted = test_preds, Actual = actual)
+kable(conf_matrix, caption = "Confusion Matrix (threshold = 0.5)")
+
+# Key metrics derived from the confusion matrix
+TP <- conf_matrix["1", "1"]
+TN <- conf_matrix["0", "0"]
+FP <- conf_matrix["1", "0"]
+FN <- conf_matrix["0", "1"]
+
+accuracy    <- (TP + TN) / sum(conf_matrix)
+sensitivity <- TP / (TP + FN)   # also called Recall — of actual defaulters, how many did we catch?
+precision   <- TP / (TP + FP)   # of predicted defaulters, how many were real?
+specificity <- TN / (TN + FP)
+
+cat("Accuracy:   ", round(accuracy * 100, 2), "%\n")
+cat("Sensitivity:", round(sensitivity * 100, 2), "% (defaulters correctly identified)\n")
+cat("Specificity:", round(specificity * 100, 2), "% (non-defaulters correctly identified)\n")
+cat("Precision:  ", round(precision * 100, 2), "% (of flagged customers, how many truly defaulted)\n")
+```
+
+> **Note on the class imbalance:** Only ~4.1% of customers defaulted, so raw accuracy is
+> misleading — a model that predicts "no default" for everyone would score ~96% accuracy
+> while catching zero actual defaulters. Sensitivity is the more important metric here:
+> it tells us what share of real defaulters the model actually flags.
+
+### ROC Curve & AUC
+
+The AUC (Area Under the Curve) is the industry standard metric for PD models. It measures
+how well the model *ranks* customers by risk, regardless of any fixed threshold. A score
+of 0.5 is random guessing; above 0.70 is generally considered acceptable for credit risk.
+
+```{r}
+roc_obj <- roc(actual, test_probs)
+auc_val <- auc(roc_obj)
+cat("AUC:", round(auc_val, 4), "\n")
+
+plot(roc_obj,
+     main = paste("ROC Curve (AUC =", round(auc_val, 3), ")"),
+     col  = "steelblue",
+     lwd  = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray50")  # random baseline
+```
+
+### Quick Note on the 0.5 Threshold
+
+The default 0.5 cutoff treats missing a defaulter as equally bad as a false alarm.
+In credit risk, missing a real defaulter (false negative) is usually more costly than
+a false alarm (false positive). If the business wants to catch more defaulters at the
+expense of more false alarms, the threshold can be lowered — for example to 0.3.
+This is a business decision, not a modelling one.
+
+```{r}
+# Example: how sensitivity and precision change at a lower threshold
+test_preds_low <- ifelse(test_probs > 0.3, 1, 0)
+conf_low       <- table(Predicted = test_preds_low, Actual = actual)
+
+TP2 <- conf_low["1", "1"]
+FP2 <- conf_low["1", "0"]
+FN2 <- conf_low["0", "1"]
+
+cat("At threshold 0.30:\n")
+cat("Sensitivity:", round(TP2 / (TP2 + FN2) * 100, 2), "%\n")
+cat("Precision:  ", round(TP2 / (TP2 + FP2) * 100, 2), "%\n")
+```
